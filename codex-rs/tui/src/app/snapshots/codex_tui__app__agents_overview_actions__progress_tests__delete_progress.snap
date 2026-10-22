@@ -1,0 +1,29 @@
+---
+source: tui/src/app/agents_overview_action_progress_tests.rs
+assertion_line: 86
+expression: normalize_agent_center_snapshot(terminal.backend().to_string())
+---
+"  Agent command center  Group: Pr…  "
+"   All 3   Needs you 0           ›  "
+"  ────────────────────────────────  "
+"      Tasks                         "
+"  /tmp/project  3                   "
+"    ○ First task                    "
+"  › ○ Selected task                 "
+"    ○ Last task                     "
+"                                    "
+"                                    "
+"  Deleting task…                    "
+"  Please wait. Task switching is    "
+"  unavailable until this finishes.  "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"                                    "
+"  ? help  esc back  ↑/↓ move  ent…  "
