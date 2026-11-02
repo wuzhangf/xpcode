@@ -335,7 +335,7 @@ async fn sse_cursor_and_last_event_id_conflict_is_400() {
     .await;
     assert_eq!(status, 400);
     let body = read_body(&mut r, &headers).await;
-    assert!(body.contains("CURSOR_CONFLICT"), "body: {body}");
+    assert!(body.contains("EVENT_CURSOR_CONFLICT"), "body: {body}");
 
     // Agreeing values are not a conflict: resume at seq > 2 and only the
     // delta appended afterwards (seq 3) arrives.
