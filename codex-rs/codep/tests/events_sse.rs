@@ -258,7 +258,10 @@ async fn json_polling_returns_output_delta_rows_byte_shape() {
     let items = page["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["kind"], "OUTPUT_DELTA");
-    assert_eq!(items[0]["payload"]["delta"], "chunk-1");
+    // wire rows spread payload fields next to the envelope (pi-compatible);
+    // no nested `payload` may cross the JSON/SSE faces.
+    assert!(items[0]["payload"].is_null());
+    assert_eq!(items[0]["delta"], "chunk-1");
     server.abort();
 }
 
