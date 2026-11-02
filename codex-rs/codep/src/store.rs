@@ -601,7 +601,7 @@ impl Store {
     }
 
     /// Atomic assistant completion: durable (task,thread,item) row dedup, the
-    /// bounded accumulated output and the message.completed event commit
+    /// bounded accumulated output and the ASSISTANT_MESSAGE event commit
     /// together. Returns false when the (thread,item) evidence was seen or
     /// the durable binding no longer names this thread+turn.
     pub fn record_agent_message(
@@ -674,7 +674,7 @@ impl Store {
         Self::event_tx(
             &tx,
             task,
-            "message.completed",
+            "ASSISTANT_MESSAGE",
             &json!({"nativeItemId":item_id,"nativeTurnId":turn,"text":text}),
         )?;
         tx.commit()?;
