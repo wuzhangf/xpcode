@@ -7,9 +7,11 @@
 //! 404 FIXED_LOCAL_ROUTE_REQUIRED.
 
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use axum::Router;
@@ -21,6 +23,8 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::response::sse::Event;
+use axum::response::sse::Sse;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
@@ -37,7 +41,8 @@ pub const ENGINE_VERSION: &str = "codep 0.1.0 codex-core-0.163.0a11.2";
 const BODY_MAX: usize = 1024 * 1024;
 
 pub struct Host {
-    pub driver: Arc<Driver>,
+    /// `None` only in tests serving read surfaces without a live engine.
+    pub driver: Option<Arc<Driver>>,
     pub store: SharedStore,
     pub token: String,
     pub state_root: PathBuf,
@@ -61,12 +66,24 @@ impl Host {
             .unwrap_or_else(|_| json!({}))
     }
 
-    fn task(&self, id: &str) -> Result<Value, Response> {
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(error("TASK_NOT_FOUND"));
+    /// The live engine. Absent only under tests, where mutating routes report
+    /// the writer as unproven — the same failure a dead thread would give.
+    fn driver(&self) -> Result<&Arc<Driver>, Response> {
+        self.driver
+            .as_ref()
+            .ok_or_else(|| error("NATIVE_WRITER_UNPROVEN"))
+    }
+
+    /// Live-root check: absent driver behaves like an absent thread.
+    async fn live_thread(&self, id: &str) -> Option<()> {
+        match &self.driver {
+            Some(d) => d.live_thread(id).await.map(|_| ()),
+            None => None,
         }
-        let s = self.store.lock().map_err(|_| error("STORE_POISONED"))?;
-        s.task(id).map_err(|_| error("TASK_NOT_FOUND"))
+    }
+
+    fn task(&self, id: &str) -> Result<Value, Response> {
+        task_of(&self.store, id)
     }
 
     fn project(&self, id: &str) -> Result<Value, Response> {
@@ -78,8 +95,12 @@ impl Host {
     }
 }
 
+pub fn router(host: Arc<Host>) -> Router {
+    Router::new().fallback(dispatch).with_state(host)
+}
+
 pub async fn run(host: Arc<Host>, port: u16) -> Result<()> {
-    let app = Router::new().fallback(dispatch).with_state(host);
+    let app = router(host);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     tracing::info!(port, "codep worker-host listening");
     axum::serve(listener, app).await?;
@@ -95,6 +116,8 @@ fn reply(status: u16, v: Value) -> Response {
 fn status_for(code: &str) -> u16 {
     if code == "LOCAL_AUTH_REQUIRED" {
         401
+    } else if code == "CURSOR_CONFLICT" {
+        400
     } else if code.ends_with("_NOT_FOUND") || code == "FIXED_LOCAL_ROUTE_REQUIRED" {
         404
     } else {
@@ -157,7 +180,7 @@ fn url_decode(s: &str) -> String {
     out
 }
 
-async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
+pub async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
     let host_hdr = req
         .headers()
         .get(header::HOST)
@@ -194,6 +217,28 @@ async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let path = req.uri().path().to_string();
+    // SSE negotiation inputs (events route only). The Accept match ignores
+    // media-type parameters and is case-insensitive; `*/*` stays JSON so the
+    // polling response remains byte-identical for existing consumers.
+    let want_sse = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| {
+            a.split(',').any(|m| {
+                m.split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+        .unwrap_or(false);
+    let last_event_id = req
+        .headers()
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let mut body = Value::Null;
     if method == Method::POST {
@@ -289,7 +334,9 @@ async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
                 Err(r) => r,
             }
         }
-        ("GET", ["local", "v1", "tasks", id, "events"]) => task_events(&h, id, &get),
+        ("GET", ["local", "v1", "tasks", id, "events"]) => {
+            task_events(&h.store, id, &get, want_sse, last_event_id.as_deref())
+        }
         ("GET", ["local", "v1", "tasks", id, "output"]) => match h.task(id) {
             Ok(t) => reply(
                 200,
@@ -352,7 +399,7 @@ fn manifest(h: &Host) -> Response {
             "schemaVersion":"worker-host/1",
             "storeGuard":"HEADER_V1",
             "engine":{"id":ENGINE_ID,"version":ENGINE_VERSION},
-            "contracts":["worker-host/1","worker-local/1"],
+            "contracts":["worker-host/1","worker-local/1","worker-events/1"],
             "capabilities":capability_items(),
             "supportedPaths":["GET /manifest","GET /capabilities"],
         }),
@@ -579,8 +626,11 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
         }
     }
     let ws_path = h.state_root.join("workspaces").join(&task_id);
-    let final_task = match h
-        .driver
+    let driver = match h.driver() {
+        Ok(d) => Arc::clone(d),
+        Err(r) => return r,
+    };
+    let final_task = match driver
         .start_task(&task_id, &ws_path, instruction, key)
         .await
     {
@@ -611,7 +661,7 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
                 );
                 t
             };
-            h.driver.retire(&task_id).await;
+            driver.retire(&task_id).await;
             t
         }
     };
@@ -786,10 +836,13 @@ async fn command(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                     return error("INTERNAL");
                 }
             }
-            let driver = Arc::clone(&h.driver);
+            let driver = match h.driver() {
+                Ok(d) => Arc::clone(d),
+                Err(r) => return r,
+            };
             let store = Arc::clone(&h.store);
             let task = id.to_owned();
-            let stop_key = key.clone();
+            let stop_key = key;
             tokio::spawn(async move {
                 let _ = driver.interrupt(&task).await;
                 // TurnAborted settles CANCELLED when a turn was active; if it
@@ -910,7 +963,7 @@ async fn task_message(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                 rejected(h, id, &key, body, id, "NATIVE_NOT_RUNNING");
                 return error("NATIVE_NOT_RUNNING");
             }
-            if h.driver.live_thread(id).await.is_none() {
+            if h.live_thread(id).await.is_none() {
                 rejected(h, id, &key, body, id, "NATIVE_WRITER_UNPROVEN");
                 return error("NATIVE_WRITER_UNPROVEN");
             }
@@ -926,7 +979,10 @@ async fn task_message(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                     return error("INTERNAL");
                 }
             }
-            let d = Arc::clone(&h.driver);
+            let d = match h.driver() {
+                Ok(d) => Arc::clone(d),
+                Err(r) => return r,
+            };
             let (task, k, c) = (id.to_owned(), key.clone(), content.clone());
             tokio::spawn(async move {
                 let _ = d.steer(&task, &k, &c, &turn).await;
@@ -938,7 +994,7 @@ async fn task_message(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                 rejected(h, id, &key, body, id, "NATIVE_NOT_IDLE");
                 return error("NATIVE_NOT_IDLE");
             }
-            if h.driver.live_thread(id).await.is_none() {
+            if h.live_thread(id).await.is_none() {
                 rejected(h, id, &key, body, id, "NATIVE_WRITER_UNPROVEN");
                 return error("NATIVE_WRITER_UNPROVEN");
             }
@@ -954,7 +1010,10 @@ async fn task_message(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                     return error("INTERNAL");
                 }
             }
-            let d = Arc::clone(&h.driver);
+            let d = match h.driver() {
+                Ok(d) => Arc::clone(d),
+                Err(r) => return r,
+            };
             let (task, k, c) = (id.to_owned(), key.clone(), content.clone());
             tokio::spawn(async move {
                 let _ = d.follow_up(&task, &k, &c).await;
@@ -1018,12 +1077,26 @@ fn task_messages(h: &Host, id: &str, get: &dyn Fn(&str) -> Option<String>) -> Re
     }
 }
 
-fn task_events(h: &Host, id: &str, get: &dyn Fn(&str) -> Option<String>) -> Response {
-    if let Err(r) = h.task(id) {
+fn task_of(store: &SharedStore, id: &str) -> Result<Value, Response> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(error("TASK_NOT_FOUND"));
+    }
+    let s = store.lock().map_err(|_| error("STORE_POISONED"))?;
+    s.task(id).map_err(|_| error("TASK_NOT_FOUND"))
+}
+
+fn task_events(
+    store: &SharedStore,
+    id: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+    sse: bool,
+    last_event_id: Option<&str>,
+) -> Response {
+    if let Err(r) = task_of(store, id) {
         return r;
     }
-    let cursor = match parse_i64(get("cursor")) {
-        Ok(v) => v.unwrap_or(0),
+    let cursor_query = match parse_i64(get("cursor")) {
+        Ok(v) => v,
         Err(r) => return r,
     };
     let limit = match get("limit") {
@@ -1033,12 +1106,89 @@ fn task_events(h: &Host, id: &str, get: &dyn Fn(&str) -> Option<String>) -> Resp
         },
         None => 50,
     };
-    let s = match store_of(h) {
-        Ok(s) => s,
-        Err(r) => return r,
+    // `Last-Event-ID` is an SSE cursor equivalent; the JSON face ignores it
+    // entirely. On the SSE face both sources must agree when both are sent.
+    let cursor = match (cursor_query, sse.then_some(last_event_id).flatten()) {
+        (Some(c), Some(l)) => match l.parse::<i64>() {
+            Ok(n) if n == c => n,
+            Ok(_) => return error("CURSOR_CONFLICT"),
+            Err(_) => return error("INVALID_ARGUMENT"),
+        },
+        (Some(c), None) => c,
+        (None, Some(l)) => match l.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => return error("INVALID_ARGUMENT"),
+        },
+        (None, None) => 0,
     };
-    match s.events(id, cursor, limit) {
-        Ok(v) => reply(200, v),
-        Err(_) => error("INTERNAL"),
+    if sse {
+        task_events_sse(store, id, cursor, limit)
+    } else {
+        let s = match store.lock() {
+            Ok(s) => s,
+            Err(_) => return error("STORE_POISONED"),
+        };
+        match s.events(id, cursor, limit) {
+            Ok(v) => reply(200, v),
+            Err(_) => error("INTERNAL"),
+        }
     }
+}
+
+/// SSE read surface for the events spine (worker-events/1): replay every row
+/// after `cursor` through the current high-water mark, then keep polling on a
+/// ~300ms tick; after ~15s idle emit a `: heartbeat {millis}` comment frame so
+/// proxies stay warm. Frames carry `id` = event seq so reconnecting clients
+/// can resume via `Last-Event-ID`. The store has no notify channel, so this
+/// is a bounded poll — it ends quietly when the client disconnects (axum
+/// drops the stream) or the store stops answering.
+fn task_events_sse(store: &SharedStore, id: &str, cursor: i64, page_limit: i64) -> Response {
+    let poll_tick = Duration::from_millis(300);
+    let heartbeat_idle = Duration::from_secs(15);
+    let store = Arc::clone(store);
+    let task = id.to_owned();
+    let stream = async_stream::stream! {
+        let mut cursor = cursor;
+        let mut last_frame = Instant::now();
+        loop {
+            let page = match store.lock() {
+                Ok(s) => s.events(&task, cursor, page_limit).ok(),
+                Err(_) => None,
+            };
+            let Some(page) = page else { break };
+            let mut emitted = false;
+            for item in page["items"].as_array().cloned().unwrap_or_default() {
+                let seq = item["cursor"].as_str().unwrap_or_default().to_owned();
+                let kind = item["kind"].as_str().unwrap_or("message").to_owned();
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .id(seq)
+                        .event(kind)
+                        .data(item.to_string()),
+                );
+                emitted = true;
+            }
+            if let Some(c) = page["cursor"]
+                .as_str()
+                .and_then(|c| c.parse::<i64>().ok())
+            {
+                cursor = c.max(cursor);
+            }
+            if emitted {
+                last_frame = Instant::now();
+                continue;
+            }
+            let idle = last_frame.elapsed();
+            if idle >= heartbeat_idle {
+                yield Ok(Event::default().comment(format!(
+                    "heartbeat {}",
+                    chrono::Utc::now().timestamp_millis()
+                )));
+                last_frame = Instant::now();
+                continue;
+            }
+            sleep(poll_tick.min(heartbeat_idle - idle)).await;
+        }
+    };
+    Sse::new(stream).into_response()
 }
