@@ -1877,6 +1877,7 @@ name = "codep"
 version = "0.163.0-alpha.11.2"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "chrono",
  "clap",

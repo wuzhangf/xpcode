@@ -3,11 +3,6 @@
 //!   codep init  --state <dir> [--project <path>]
 //!   codep serve --state <dir> --port <p>
 
-mod canon;
-mod driver;
-mod host;
-mod store;
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,15 +12,17 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use clap::Subcommand;
+use codep::canon;
+use codep::driver;
+use codep::driver::SharedStore;
+use codep::host;
+use codep::host::Host;
+use codep::store::Store;
 use codex_core_api::Arg0DispatchPaths;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::set_default_originator;
 use serde_json::Value;
 use serde_json::json;
-
-use crate::driver::SharedStore;
-use crate::host::Host;
-use crate::store::Store;
 
 #[derive(Debug, Parser)]
 #[command(name = "codep", about = "worker-host service backed by in-process codex-core")]
@@ -181,7 +178,7 @@ fn init(state: &Path, project: Option<&Path>) -> Result<()> {
     std::fs::write(state.join("codex-home").join("config.toml"), toml)?;
 
     println!("codep init complete: {}", state.display());
-    println!("identity: {}", identity);
+    println!("identity: {identity}");
     println!("projects: {}", registry["items"]);
     Ok(())
 }
@@ -239,7 +236,7 @@ async fn serve(arg0: &Arg0DispatchPaths, state: &Path, port: u16) -> Result<()> 
     }
     let driver = driver::boot(arg0, state, Arc::clone(&store)).await?;
     let host = Arc::new(Host {
-        driver,
+        driver: Some(driver),
         store,
         token,
         state_root: state.to_path_buf(),

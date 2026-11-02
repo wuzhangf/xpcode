@@ -53,6 +53,7 @@ use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
+use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -246,17 +247,17 @@ impl Driver {
                 /*mcp_elicitations_auto_deny*/ true,
             )
             .await;
-        {
-            let mut live = self.tasks.lock().await;
-            live.insert(task.to_string(), TaskLive {
+        self.tasks.lock().await.insert(
+            task.to_string(),
+            TaskLive {
                 thread: Arc::clone(&thread),
                 thread_id,
-            });
-            self.thread_task
-                .lock()
-                .await
-                .insert(thread_id, task.to_string());
-        }
+            },
+        );
+        self.thread_task
+            .lock()
+            .await
+            .insert(thread_id, task.to_string());
         {
             let mut s = self.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
             s.update(task, |t| {
@@ -696,11 +697,41 @@ async fn project(
             )?;
         }
         EventMsg::ShutdownComplete => {}
+        EventMsg::AgentMessageContentDelta(e) => {
+            output_delta(&d.store, task, &e);
+        }
         _ => {
             auto_answer(d, task, thread, &msg, false).await;
         }
     }
     Ok(())
+}
+
+/// Typewriter spine projection: `AgentMessageContentDelta` carries the public
+/// assistant text increments core already streams through the event loop; pin
+/// each to the durable events table as `OUTPUT_DELTA` so the events read
+/// surface can replay or tail them (worker-events/1). Reasoning, plan and
+/// exec-output deltas stay private and keep falling to the catch-all.
+/// A persist failure must never kill the turn — warn and continue, same as
+/// `record_agent_message`'s non-fatal handling above.
+pub fn output_delta(store: &SharedStore, task: &str, e: &AgentMessageContentDeltaEvent) {
+    let result = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("STORE_POISONED"))
+        .and_then(|s| {
+            s.event(
+                task,
+                "OUTPUT_DELTA",
+                json!({
+                    "nativeTurnId": e.turn_id,
+                    "nativeItemId": e.item_id,
+                    "delta": e.delta,
+                }),
+            )
+        });
+    if let Err(err) = result {
+        warn!(task, "OUTPUT_DELTA event persist failed: {err}");
+    }
 }
 
 /// Safety net for approval-shaped events that should never appear under
