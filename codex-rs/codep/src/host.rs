@@ -1088,6 +1088,27 @@ fn task_of(store: &SharedStore, id: &str) -> Result<Value, Response> {
     s.task(id).map_err(|_| error("TASK_NOT_FOUND"))
 }
 
+/// worker-events/1 wire shape: kind-specific fields travel next to the common
+/// envelope (cursor/seq/kind/occurredAt/taskId) — the same flat row vocabulary
+/// pi emits and both clients fold. The durable `payload` object spreads into
+/// the top level at read time; envelope keys win collisions so a payload can
+/// never rewrite identity fields.
+fn public_event_row(item: &Value) -> Value {
+    let Some(payload) = item.get("payload").and_then(Value::as_object) else {
+        return item.clone();
+    };
+    let payload = payload.clone();
+    let mut row = item.clone();
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    obj.remove("payload");
+    for (k, v) in payload {
+        obj.entry(k).or_insert(v);
+    }
+    row
+}
+
 fn task_events(
     store: &SharedStore,
     id: &str,
@@ -1132,7 +1153,14 @@ fn task_events(
             Err(_) => return error("STORE_POISONED"),
         };
         match s.events(id, cursor, limit) {
-            Ok(v) => reply(200, v),
+            Ok(mut v) => {
+                if let Some(items) = v["items"].as_array_mut() {
+                    for item in items.iter_mut() {
+                        *item = public_event_row(item);
+                    }
+                }
+                reply(200, v)
+            }
             Err(_) => error("INTERNAL"),
         }
     }
@@ -1161,6 +1189,7 @@ fn task_events_sse(store: &SharedStore, id: &str, cursor: i64, page_limit: i64) 
             let Some(page) = page else { break };
             let mut emitted = false;
             for item in page["items"].as_array().cloned().unwrap_or_default() {
+                let item = public_event_row(&item);
                 let seq = item["cursor"].as_str().unwrap_or_default().to_owned();
                 let kind = item["kind"].as_str().unwrap_or("message").to_owned();
                 yield Ok::<_, Infallible>(
