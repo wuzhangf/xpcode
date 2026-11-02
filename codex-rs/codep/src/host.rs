@@ -116,7 +116,7 @@ fn reply(status: u16, v: Value) -> Response {
 fn status_for(code: &str) -> u16 {
     if code == "LOCAL_AUTH_REQUIRED" {
         401
-    } else if code == "CURSOR_CONFLICT" {
+    } else if code == "EVENT_CURSOR_CONFLICT" {
         400
     } else if code.ends_with("_NOT_FOUND") || code == "FIXED_LOCAL_ROUTE_REQUIRED" {
         404
@@ -233,7 +233,10 @@ pub async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
                     .eq_ignore_ascii_case("text/event-stream")
             })
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || query
+            .iter()
+            .any(|(k, v)| k == "follow" && v == "1");
     let last_event_id = req
         .headers()
         .get("last-event-id")
@@ -1111,7 +1114,7 @@ fn task_events(
     let cursor = match (cursor_query, sse.then_some(last_event_id).flatten()) {
         (Some(c), Some(l)) => match l.parse::<i64>() {
             Ok(n) if n == c => n,
-            Ok(_) => return error("CURSOR_CONFLICT"),
+            Ok(_) => return error("EVENT_CURSOR_CONFLICT"),
             Err(_) => return error("INVALID_ARGUMENT"),
         },
         (Some(c), None) => c,
