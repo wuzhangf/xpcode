@@ -485,18 +485,53 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
         .join("")
 }
 
-fn turn_item_tool_kind(item: &TurnItem) -> Option<&'static str> {
-    Some(match item {
-        TurnItem::CommandExecution(_) => "command_execution",
-        TurnItem::McpToolCall(_) => "mcp_tool_call",
-        TurnItem::FileChange(_) => "file_change",
-        TurnItem::DynamicToolCall(_) => "dynamic_tool_call",
-        TurnItem::WebSearch(_) => "web_search",
-        TurnItem::ImageGeneration(_) => "image_generation",
-        TurnItem::CollabAgentToolCall(_) => "collab_agent_tool_call",
-        TurnItem::SubAgentActivity(_) => "sub_agent_activity",
+/// worker-events/1 tool payload: the renderer's activity merge needs a stable
+/// `toolCallId` per call plus the public label kind, a bounded human detail,
+/// and an honest terminal error flag. pi emits the same field names.
+fn turn_item_tool_fields(item: &TurnItem) -> Option<serde_json::Value> {
+    use codex_protocol::items::*;
+    use codex_protocol::protocol::PatchApplyStatus;
+    let (kind, id, detail, error) = match item {
+        TurnItem::CommandExecution(i) => (
+            "commandExecution",
+            i.id.as_str(),
+            Some(i.command.join(" ")),
+            match i.status {
+                CommandExecutionStatus::Failed | CommandExecutionStatus::Declined => true,
+                CommandExecutionStatus::Completed => i.exit_code.map_or(false, |c| c != 0),
+                _ => false,
+            },
+        ),
+        TurnItem::DynamicToolCall(i) => (
+            "dynamicToolCall",
+            i.id.as_str(),
+            Some(i.tool.clone()),
+            matches!(i.status, DynamicToolCallStatus::Failed) || i.success == Some(false),
+        ),
+        TurnItem::McpToolCall(i) => (
+            "mcpToolCall",
+            i.id.as_str(),
+            Some(format!("{}:{}", i.server, i.tool)),
+            matches!(i.status, McpToolCallStatus::Failed),
+        ),
+        TurnItem::FileChange(i) => (
+            "fileChange",
+            i.id.as_str(),
+            i.changes.keys().next().map(|p| p.display().to_string()),
+            matches!(i.status, Some(PatchApplyStatus::Failed | PatchApplyStatus::Declined)),
+        ),
+        TurnItem::WebSearch(i) => ("webSearch", i.id.as_str(), None, false),
+        TurnItem::ImageGeneration(i) => ("imageGeneration", i.id.as_str(), None, false),
+        TurnItem::CollabAgentToolCall(i) => ("collabAgentToolCall", i.id.as_str(), None, false),
+        TurnItem::SubAgentActivity(i) => ("subAgentActivity", i.id.as_str(), None, false),
         _ => return None,
-    })
+    };
+    let mut v = json!({"toolCallId": id, "toolName": kind, "isError": error});
+    if let Some(d) = detail {
+        let clipped: String = d.chars().take(200).collect();
+        v["detail"] = json!(clipped);
+    }
+    Some(v)
 }
 
 async fn project(
@@ -604,13 +639,11 @@ async fn project(
             d.retire(task).await;
         }
         EventMsg::ItemStarted(e) => {
-            if let Some(kind) = turn_item_tool_kind(&e.item) {
+            if let Some(fields) = turn_item_tool_fields(&e.item) {
+                let mut payload = fields;
+                payload["nativeTurnId"] = json!(e.turn_id);
                 let s = d.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
-                s.event(
-                    task,
-                    "TOOL_START",
-                    json!({"nativeTurnId":e.turn_id,"toolKind":kind}),
-                )?;
+                s.event(task, "TOOL_START", payload)?;
             }
             if let TurnItem::UserMessage(item) = &e.item {
                 if let Some(key) = item.client_id.as_deref() {
@@ -656,13 +689,11 @@ async fn project(
                 }
                 _ => {}
             }
-            if let Some(kind) = turn_item_tool_kind(&e.item) {
+            if let Some(fields) = turn_item_tool_fields(&e.item) {
+                let mut payload = fields;
+                payload["nativeTurnId"] = json!(e.turn_id);
                 let s = d.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
-                s.event(
-                    task,
-                    "TOOL_END",
-                    json!({"nativeTurnId":e.turn_id,"toolKind":kind}),
-                )?;
+                s.event(task, "TOOL_END", payload)?;
             }
         }
         EventMsg::TokenCount(e) => {
@@ -700,6 +731,15 @@ async fn project(
         EventMsg::AgentMessageContentDelta(e) => {
             output_delta(&d.store, task, &e);
         }
+        EventMsg::ReasoningContentDelta(e) => {
+            thinking_delta(&d.store, task, &e.turn_id, &e.item_id, &e.delta);
+        }
+        EventMsg::ReasoningRawContentDelta(e) => {
+            thinking_delta(&d.store, task, &e.turn_id, &e.item_id, &e.delta);
+        }
+        EventMsg::AgentReasoningSectionBreak(e) => {
+            thinking_delta(&d.store, task, "", &e.item_id, "\n");
+        }
         _ => {
             auto_answer(d, task, thread, &msg, false).await;
         }
@@ -731,6 +771,32 @@ pub fn output_delta(store: &SharedStore, task: &str, e: &AgentMessageContentDelt
         });
     if let Err(err) = result {
         warn!(task, "OUTPUT_DELTA event persist failed: {err}");
+    }
+}
+
+/// Reasoning spine: `ReasoningContentDelta`/`ReasoningRawContentDelta` carry the
+/// model's public thinking increments; pin them as `THINKING_DELTA` so the
+/// events read surface can replay them like the output tail. Summary items
+/// (`AgentReasoning`) still stay private — the deltas carry the same text
+/// incrementally and a full copy would double-render. Persist failure is
+/// non-fatal, same contract as `output_delta`.
+pub fn thinking_delta(store: &SharedStore, task: &str, turn_id: &str, item_id: &str, delta: &str) {
+    let result = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("STORE_POISONED"))
+        .and_then(|s| {
+            s.event(
+                task,
+                "THINKING_DELTA",
+                json!({
+                    "nativeTurnId": turn_id,
+                    "nativeItemId": item_id,
+                    "delta": delta,
+                }),
+            )
+        });
+    if let Err(err) = result {
+        warn!(task, "THINKING_DELTA event persist failed: {err}");
     }
 }
 
