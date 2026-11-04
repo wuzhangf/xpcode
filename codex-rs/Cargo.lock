@@ -1884,6 +1884,7 @@ dependencies = [
  "codex-core",
  "codex-core-api",
  "codex-protocol",
+ "futures",
  "hex",
  "rusqlite",
  "serde",

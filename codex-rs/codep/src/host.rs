@@ -7,6 +7,8 @@
 //! 404 FIXED_LOCAL_ROUTE_REQUIRED.
 
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +23,9 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::response::sse::Event as SseEvent;
+use axum::response::sse::KeepAlive;
+use axum::response::sse::Sse;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
@@ -187,6 +192,17 @@ async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
         Ok(q) => q,
         Err(r) => return r,
     };
+    let wants_sse = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    let last_event_id = req
+        .headers()
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let method = req.method().clone();
     let idem = req
         .headers()
@@ -289,7 +305,13 @@ async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
                 Err(r) => r,
             }
         }
-        ("GET", ["local", "v1", "tasks", id, "events"]) => task_events(&h, id, &get),
+        ("GET", ["local", "v1", "tasks", id, "events"]) => {
+            if wants_sse {
+                task_events_sse(&h, id, get("cursor").or(last_event_id))
+            } else {
+                task_events(&h, id, &get)
+            }
+        }
         ("GET", ["local", "v1", "tasks", id, "output"]) => match h.task(id) {
             Ok(t) => reply(
                 200,
@@ -1041,4 +1063,60 @@ fn task_events(h: &Host, id: &str, get: &dyn Fn(&str) -> Option<String>) -> Resp
         Ok(v) => reply(200, v),
         Err(_) => error("INTERNAL"),
     }
+}
+
+/// SSE branch of the events leaf: same durable event objects as the polling
+/// leaf, framed as `id: <seq>` / `event: <kind>` / `data: <event json>`; `Last-Event-ID` or the
+/// `cursor` query param resumes mid-sequence. The stream stays open until the
+/// client disconnects; axum drops the stream on disconnect.
+fn task_events_sse(h: &Arc<Host>, id: &str, cursor: Option<String>) -> Response {
+    if let Err(r) = h.task(id) {
+        return r;
+    }
+    let start = cursor
+        .as_deref()
+        .and_then(|c| c.parse::<i64>().ok())
+        .unwrap_or(0);
+    let host = Arc::clone(h);
+    let task = id.to_owned();
+    let stream = futures::stream::unfold((VecDeque::<Value>::new(), start), move |(mut pending, mut seq)| {
+        let host = Arc::clone(&host);
+        let task = task.clone();
+        async move {
+            loop {
+                if let Some(ev) = pending.pop_front() {
+                    let out = SseEvent::default()
+                        .id(ev["seq"].as_str().unwrap_or_default())
+                        .event(ev["kind"].as_str().unwrap_or("message"))
+                        .data(ev.to_string());
+                    return Some((Ok::<SseEvent, Infallible>(out), (pending, seq)));
+                }
+                let page = match host.store.lock() {
+                    Ok(s) => s
+                        .events(&task, seq, 200)
+                        .ok()
+                        .and_then(|v| v["items"].as_array().cloned()),
+                    Err(_) => None,
+                };
+                match page {
+                    Some(items) if !items.is_empty() => {
+                        for ev in &items {
+                            if let Some(n) = ev["seq"].as_str().and_then(|s| s.parse::<i64>().ok()) {
+                                seq = n;
+                            }
+                        }
+                        pending.extend(items);
+                    }
+                    _ => sleep(Duration::from_millis(150)).await,
+                }
+            }
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }

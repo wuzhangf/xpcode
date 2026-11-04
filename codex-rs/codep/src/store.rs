@@ -192,7 +192,7 @@ impl Store {
     pub fn event(&self, task: &str, kind: &str, payload: Value) -> Result<Value> {
         let seq = Self::next_event_seq(&self.db, task)?;
         let at = canon::now();
-        let ev = json!({
+        let mut ev = json!({
             "eventId": format!("event-{}", canon::new_id()),
             "cursor": seq.to_string(),
             "seq": seq.to_string(),
@@ -203,11 +203,30 @@ impl Store {
             "taskId": task,
             "payload": payload,
         });
+        Self::flatten_event_fields(&mut ev);
         self.db.execute(
             "INSERT INTO events VALUES(?1,?2,?3)",
             params![task, seq, ev.to_string()],
         )?;
         Ok(ev)
+    }
+
+    /// worker-events/1 consumers read delta/text/nativeTurnId at the event
+    /// row's top level — mirror object payload fields there without letting a
+    /// payload key overwrite the envelope's own columns.
+    fn flatten_event_fields(ev: &mut Value) {
+        let Some(fields) = ev["payload"]
+            .as_object()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
+        else {
+            return;
+        };
+        let Some(row) = ev.as_object_mut() else { return };
+        for (k, v) in fields {
+            if !row.contains_key(&k) {
+                row.insert(k, v);
+            }
+        }
     }
 
     fn event_tx(tx: &rusqlite::Transaction, task: &str, kind: &str, payload: &Value) -> Result<()> {
@@ -217,7 +236,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let at = canon::now();
-        let ev = json!({
+        let mut ev = json!({
             "eventId": format!("event-{}", canon::new_id()),
             "cursor": seq.to_string(),
             "seq": seq.to_string(),
@@ -228,6 +247,7 @@ impl Store {
             "taskId": task,
             "payload": payload,
         });
+        Self::flatten_event_fields(&mut ev);
         tx.execute(
             "INSERT INTO events VALUES(?1,?2,?3)",
             params![task, seq, ev.to_string()],
@@ -674,7 +694,7 @@ impl Store {
         Self::event_tx(
             &tx,
             task,
-            "message.completed",
+            "ASSISTANT_MESSAGE",
             &json!({"nativeItemId":item_id,"nativeTurnId":turn,"text":text}),
         )?;
         tx.commit()?;
