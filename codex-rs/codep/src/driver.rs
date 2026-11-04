@@ -81,7 +81,22 @@ pub struct Driver {
     tasks: AsyncMutex<HashMap<String, TaskLive>>,
     /// codex thread_id -> owning task (roots + discovered children)
     thread_task: AsyncMutex<HashMap<ThreadId, String>>,
+    /// (task_id, item_id) -> in-flight assistant text delta buffer
+    deltas: Arc<Mutex<HashMap<(String, String), DeltaBuf>>>,
 }
+
+/// Assistant text coalescer: `AgentMessageContentDelta` arrives token-sized;
+/// consumers get `assistant.delta` durable events carrying `textSoFar` at most
+/// every DELTA_FLUSH_MS per item, plus a `final:true` frame when the item ends.
+struct DeltaBuf {
+    turn_id: String,
+    text: String,
+    emitted: usize,
+    last_emit: std::time::Instant,
+    scheduled: bool,
+}
+
+const DELTA_FLUSH_MS: u64 = 80;
 
 /// Boot sequence copied from codex-rs/thread-manager-sample/src/main.rs.
 pub async fn boot(arg0: &Arg0DispatchPaths, state_root: &Path, store: SharedStore) -> Result<Arc<Driver>> {
@@ -155,6 +170,7 @@ pub async fn boot(arg0: &Arg0DispatchPaths, state_root: &Path, store: SharedStor
         store,
         tasks: AsyncMutex::new(HashMap::new()),
         thread_task: AsyncMutex::new(HashMap::new()),
+        deltas: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // Subagent/child threads: attach a consumer each so their approvals never
@@ -426,6 +442,7 @@ async fn event_loop(
             Err(e) => {
                 if !child {
                     warn!(task, "thread event stream ended: {e}");
+                    drain_deltas(&d, &task);
                     settle_dead_writer(&d, &task, "NATIVE_EVENT_STREAM_CLOSED");
                 }
                 return;
@@ -471,6 +488,105 @@ fn settle_dead_writer(d: &Driver, task: &str, code: &str) {
                 let _ = s.event(task, "task.unproven", json!({"reasonCode":code}));
             }
         }
+    }
+}
+
+/// Emit whatever is pending for one delta buffer as an additive
+/// worker-events/1 OUTPUT_DELTA row (must be called with the deltas map lock
+/// held; the store lock is taken inside the same critical section so lock
+/// order is always deltas -> store). Terminal state is owned by the
+/// ASSISTANT_MESSAGE row — an empty flush emits nothing.
+fn flush_delta_locked(
+    d: &Arc<Driver>,
+    task: &str,
+    key: &(String, String),
+    map: &mut HashMap<(String, String), DeltaBuf>,
+) {
+    let Some(buf) = map.get_mut(key) else { return };
+    buf.scheduled = false;
+    let chunk = &buf.text[buf.emitted..];
+    if chunk.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "nativeTurnId": buf.turn_id,
+        "nativeItemId": key.1,
+        "delta": chunk,
+    });
+    buf.emitted = buf.text.len();
+    buf.last_emit = std::time::Instant::now();
+    if let Ok(s) = d.store.lock() {
+        let _ = s.event(task, "OUTPUT_DELTA", payload);
+    }
+}
+
+fn lock_deltas(d: &Arc<Driver>) -> std::sync::MutexGuard<'_, HashMap<(String, String), DeltaBuf>> {
+    d.deltas.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Accumulate one token delta; emit immediately when past the flush window,
+/// otherwise arm a single delayed flush per item.
+async fn on_assistant_delta(
+    d: &Arc<Driver>,
+    task: &str,
+    e: codex_protocol::protocol::AgentMessageContentDeltaEvent,
+) {
+    let key = (task.to_owned(), e.item_id.clone());
+    let mut spawn_flush = false;
+    {
+        let mut map = lock_deltas(d);
+        let buf = map.entry(key.clone()).or_insert_with(|| DeltaBuf {
+            turn_id: String::new(),
+            text: String::new(),
+            emitted: 0,
+            last_emit: std::time::Instant::now(),
+            scheduled: false,
+        });
+        if buf.turn_id.is_empty() {
+            buf.turn_id = e.turn_id.clone();
+        }
+        buf.text.push_str(&e.delta);
+        if buf.last_emit.elapsed().as_millis() >= DELTA_FLUSH_MS as u128 {
+            flush_delta_locked(d, task, &key, &mut map);
+        } else if !buf.scheduled {
+            buf.scheduled = true;
+            spawn_flush = true;
+        }
+    }
+    if spawn_flush {
+        let d2 = Arc::clone(d);
+        let task2 = task.to_owned();
+        let key2 = key;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(DELTA_FLUSH_MS)).await;
+            let mut map = lock_deltas(&d2);
+            flush_delta_locked(&d2, &task2, &key2, &mut map);
+        });
+    }
+}
+
+/// The agent-message item completed: emit a final frame carrying the full
+/// textSoFar, then drop the buffer.
+fn finish_delta_item(d: &Arc<Driver>, task: &str, item_id: &str) {
+    let key = (task.to_owned(), item_id.to_owned());
+    let mut map = lock_deltas(d);
+    if map.contains_key(&key) {
+        flush_delta_locked(d, task, &key, &mut map);
+        map.remove(&key);
+    }
+}
+
+/// Turn ended (completed/aborted/stream closed): flush and drop every buffer
+/// belonging to this task so no partial text is ever stranded.
+fn drain_deltas(d: &Arc<Driver>, task: &str) {
+    let keys: Vec<(String, String)> = {
+        let map = lock_deltas(d);
+        map.keys().filter(|(t, _)| t == task).cloned().collect()
+    };
+    for key in keys {
+        let mut map = lock_deltas(d);
+        flush_delta_locked(d, task, &key, &mut map);
+        map.remove(&key);
     }
 }
 
@@ -566,8 +682,10 @@ async fn project(
             if failed {
                 d.retire(task).await;
             }
+            drain_deltas(d, task);
         }
         EventMsg::TurnAborted(e) => {
+            drain_deltas(d, task);
             {
                 let mut s = d.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
                 let stop_key = s.task(task)?["pendingStopKey"].as_str().map(str::to_owned);
@@ -640,6 +758,7 @@ async fn project(
                     }
                 }
                 TurnItem::AgentMessage(item) => {
+                    finish_delta_item(d, task, &item.id);
                     let text = agent_message_text(item);
                     if !text.is_empty() {
                         let mut s =
@@ -694,6 +813,9 @@ async fn project(
                 "stream.error",
                 json!({"message":e.message}),
             )?;
+        }
+        EventMsg::AgentMessageContentDelta(e) => {
+            on_assistant_delta(d, task, e).await;
         }
         EventMsg::ShutdownComplete => {}
         _ => {
