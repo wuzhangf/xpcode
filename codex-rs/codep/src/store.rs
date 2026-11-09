@@ -248,6 +248,19 @@ impl Store {
         )
     }
 
+    /// Latest durable event for the task, used for the detail projection's
+    /// lastEventAt/lastEventKind high-water facts.
+    pub fn last_event(&self, task: &str) -> Option<Value> {
+        self.db
+            .query_row(
+                "SELECT json FROM events WHERE task=?1 ORDER BY seq DESC LIMIT 1",
+                [task],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
     pub fn events(&self, task: &str, cursor: i64, limit: i64) -> Result<Value> {
         let mut q = self.db.prepare(
             "SELECT seq,json FROM events WHERE task=?1 AND seq>?2 ORDER BY seq LIMIT ?3",

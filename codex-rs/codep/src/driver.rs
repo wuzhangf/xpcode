@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -63,8 +64,10 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::sleep;
 use tracing::warn;
 
+use crate::canon;
 use crate::store::Store;
 
 pub type SharedStore = Arc<Mutex<Store>>;
@@ -339,12 +342,73 @@ impl Driver {
         Ok(())
     }
 
+    /// Per-task execution window. When the deadline lands and the task is
+    /// not yet terminal, interrupt it and settle TIMED_OUT with
+    /// TASK_DEADLINE_EXCEEDED — never silently leave a task running past
+    /// the window the launcher declared.
+    pub fn watch_deadline(self: &Arc<Self>, task: &str, deadline: Duration) {
+        let d = Arc::clone(self);
+        let task = task.to_string();
+        tokio::spawn(async move {
+            sleep(deadline).await;
+            {
+                let Ok(s) = d.store.lock() else { return };
+                let Ok(t) = s.task(&task) else { return };
+                if t["state"].as_str().map(terminal).unwrap_or(true) {
+                    return;
+                }
+            }
+            // Interrupt first so a live turn starts unwinding, then settle
+            // the task record itself (TurnAborted must not resurrect it).
+            let _ = d.interrupt(&task).await;
+            if let Ok(mut s) = d.store.lock() {
+                let cmd = s
+                    .update(&task, |t| {
+                        if !t["state"].as_str().map(terminal).unwrap_or(true) {
+                            let now = canon::now();
+                            t["state"] = json!("TIMED_OUT");
+                            t["quiescent"] = json!(true);
+                            t["reasonCode"] = json!("TASK_DEADLINE_EXCEEDED");
+                            t["endedAt"] = json!(now.clone());
+                            t["completedAt"] = json!(now);
+                            t.as_object_mut().map(|o| o.remove("pendingStopKey"));
+                        }
+                    })
+                    .ok()
+                    .and_then(|t| {
+                        t["currentCommandId"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                let _ = s.event(
+                    &task,
+                    "task.deadline",
+                    json!({"reasonCode":"TASK_DEADLINE_EXCEEDED"}),
+                );
+                if !cmd.is_empty() {
+                    let _ = s.receipt_auto(
+                        &task,
+                        &cmd,
+                        "FAILED",
+                        &json!({"kind":"WORKER_LOCAL","requestKey":cmd,"state":"FAILED","detail":"execution deadline exceeded"}),
+                    );
+                }
+            }
+            d.retire(&task).await;
+        });
+    }
+
     fn after_submit_applied(&self, task: &str, key: &str, turn_id: &str) -> Result<()> {
         let mut s = self.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
         s.update(task, |t| {
             if matches!(t["state"].as_str(), Some("PREPARING" | "QUEUED" | "STARTING" | "SUCCEEDED")) {
                 t["state"] = json!("RUNNING");
                 t["quiescent"] = json!(false);
+                t.as_object_mut().map(|o| {
+                    o.remove("endedAt");
+                    o.remove("completedAt");
+                });
             }
         })?;
         let thread = s
@@ -368,7 +432,7 @@ impl Driver {
         // A follow-up that could not start leaves the task where it was.
         s.update(task, |t| {
             if t["currentCommandId"].as_str() == Some(key)
-                && !matches!(t["state"].as_str(), Some("CANCELLED" | "FAILED" | "UNKNOWN"))
+                && !t["state"].as_str().map(terminal).unwrap_or(true)
             {
                 // Revert the engaged mark: the turn never started.
                 if t["nativeTurnId"].is_null() {
@@ -407,6 +471,16 @@ impl Driver {
             let _ = live.thread.shutdown_and_wait().await;
         }
     }
+}
+
+/// Terminal task states: once reached, in-flight turn events must not
+/// resurrect or re-label the settle (e.g. a late TurnAborted clobbering
+/// TIMED_OUT back to CANCELLED).
+fn terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "FAILED" | "CANCELLED" | "UNKNOWN" | "TIMED_OUT" | "INTERRUPTED" | "STOPPED"
+    )
 }
 
 /// Per-thread event consumer. For root threads (`child == false`) it projects
@@ -459,9 +533,12 @@ fn settle_dead_writer(d: &Driver, task: &str, code: &str) {
             if live {
                 let cmd = t["currentCommandId"].as_str().unwrap_or_default().to_owned();
                 let _ = s.update(task, |t| {
+                    let now = canon::now();
                     t["state"] = json!("UNKNOWN");
                     t["quiescent"] = json!(true);
                     t["reasonCode"] = json!(code);
+                    t["endedAt"] = json!(now.clone());
+                    t["completedAt"] = json!(now);
                 });
                 let _ = s.receipt_auto(
                     task,
@@ -555,6 +632,10 @@ async fn project(
                 ) {
                     t["state"] = json!("RUNNING");
                     t["quiescent"] = json!(false);
+                    t.as_object_mut().map(|o| {
+                        o.remove("endedAt");
+                        o.remove("completedAt");
+                    });
                 }
             })?;
             s.event(task, "turn/started", json!({"nativeTurnId":e.turn_id}))?;
@@ -575,12 +656,19 @@ async fn project(
                     }
                 }
                 let t = s.update(task, |t| {
-                    t["state"] = json!(if failed { "FAILED" } else { "SUCCEEDED" });
-                    t["quiescent"] = json!(true);
-                    if failed {
-                        t["reasonCode"] = json!("NATIVE_TURN_FAILED");
-                    } else {
-                        t.as_object_mut().map(|o| o.remove("reasonCode"));
+                    // A late completion after a deadline/stop settle must
+                    // not resurrect the terminal state.
+                    if !t["state"].as_str().map(terminal).unwrap_or(true) {
+                        let now = canon::now();
+                        t["state"] = json!(if failed { "FAILED" } else { "SUCCEEDED" });
+                        t["quiescent"] = json!(true);
+                        t["endedAt"] = json!(now.clone());
+                        t["completedAt"] = json!(now);
+                        if failed {
+                            t["reasonCode"] = json!("NATIVE_TURN_FAILED");
+                        } else {
+                            t.as_object_mut().map(|o| o.remove("reasonCode"));
+                        }
                     }
                 })?;
                 s.event(
@@ -608,9 +696,16 @@ async fn project(
                 let mut s = d.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
                 let stop_key = s.task(task)?["pendingStopKey"].as_str().map(str::to_owned);
                 let t = s.update(task, |t| {
-                    t["state"] = json!("CANCELLED");
-                    t["quiescent"] = json!(true);
-                    t["reasonCode"] = json!("TASK_STOPPED");
+                    // Keep an earlier terminal settle (e.g. TIMED_OUT fired
+                    // before the abort landed) instead of re-labelling it.
+                    if !t["state"].as_str().map(terminal).unwrap_or(true) {
+                        let now = canon::now();
+                        t["state"] = json!("CANCELLED");
+                        t["quiescent"] = json!(true);
+                        t["reasonCode"] = json!("TASK_STOPPED");
+                        t["endedAt"] = json!(now.clone());
+                        t["completedAt"] = json!(now);
+                    }
                     t.as_object_mut().map(|o| o.remove("pendingStopKey"));
                 })?;
                 s.event(
