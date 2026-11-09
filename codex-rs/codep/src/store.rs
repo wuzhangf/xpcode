@@ -189,10 +189,27 @@ impl Store {
         )?)
     }
 
+    /// worker-events/1 turn attribution: the renderer groups activity by the
+    /// input that produced it, so every durable event carries the task row's
+    /// current command/segment/session identity — pi stamps the same fields.
+    fn stamp_event_envelope(task_row: &Value, ev: &mut Value) {
+        for (src, dst) in [
+            ("generation", "generation"),
+            ("segmentId", "segmentId"),
+            ("nativeSessionId", "nativeSessionId"),
+            ("nativeTurnId", "nativeTurnId"),
+            ("currentCommandId", "targetCommandId"),
+        ] {
+            if let Some(v) = task_row.get(src).filter(|v| !v.is_null()) {
+                ev[dst] = v.clone();
+            }
+        }
+    }
+
     pub fn event(&self, task: &str, kind: &str, payload: Value) -> Result<Value> {
         let seq = Self::next_event_seq(&self.db, task)?;
         let at = canon::now();
-        let ev = json!({
+        let mut ev = json!({
             "eventId": format!("event-{}", canon::new_id()),
             "cursor": seq.to_string(),
             "seq": seq.to_string(),
@@ -203,6 +220,16 @@ impl Store {
             "taskId": task,
             "payload": payload,
         });
+        if let Some(t) = self
+            .db
+            .query_row("SELECT json FROM tasks WHERE id=?1", [task], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            Self::stamp_event_envelope(&t, &mut ev);
+        }
         self.db.execute(
             "INSERT INTO events VALUES(?1,?2,?3)",
             params![task, seq, ev.to_string()],
@@ -217,7 +244,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let at = canon::now();
-        let ev = json!({
+        let mut ev = json!({
             "eventId": format!("event-{}", canon::new_id()),
             "cursor": seq.to_string(),
             "seq": seq.to_string(),
@@ -228,6 +255,15 @@ impl Store {
             "taskId": task,
             "payload": payload,
         });
+        if let Some(t) = tx
+            .query_row("SELECT json FROM tasks WHERE id=?1", [task], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            Self::stamp_event_envelope(&t, &mut ev);
+        }
         tx.execute(
             "INSERT INTO events VALUES(?1,?2,?3)",
             params![task, seq, ev.to_string()],
@@ -348,7 +384,6 @@ impl Store {
                 result.to_string()
             ],
         )?;
-        Self::request_accepted_event_tx(&tx, task, key)?;
         let s: String = tx.query_row("SELECT json FROM tasks WHERE id=?1", [task], |r| r.get(0))?;
         let mut t: Value = serde_json::from_str(&s)?;
         t["currentCommandId"] = json!(key);
@@ -362,6 +397,10 @@ impl Store {
             "INSERT INTO tasks VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET json=excluded.json",
             params![task, t.to_string()],
         )?;
+        // The intake event must follow the command rotation: its envelope
+        // stamps currentCommandId, which must already be this request's key
+        // or the event groups under the previous turn in the UI.
+        Self::request_accepted_event_tx(&tx, task, key)?;
         Self::tx_insert_message(
             &tx,
             task,
