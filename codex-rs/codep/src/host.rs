@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use anyhow::bail;
 use axum::Router;
 use axum::body::to_bytes;
 use axum::extract::Request;
@@ -439,6 +440,9 @@ fn preflight_response(h: &Host, project_id: &str, engine: &str) -> Result<Value,
         return Err(error("ENGINE_NOT_REGISTERED"));
     }
     let p = h.project(project_id)?;
+    let path = p["path"].as_str().unwrap_or_default();
+    let head = git_head_revision(path).unwrap_or_else(|| p["headRevision"].clone());
+    let dirty = git_has_uncommitted(path);
     let base = json!({
         "projectId":p["projectId"],
         "engineId":ENGINE_ID,
@@ -446,8 +450,8 @@ fn preflight_response(h: &Host, project_id: &str, engine: &str) -> Result<Value,
         "profileId":"MANAGED",
         "profileHome":null,
         "loadsUserExtensions":false,
-        "headRevision":p["headRevision"],
-        "hasUncommittedChanges":false,
+        "headRevision":head,
+        "hasUncommittedChanges":dirty,
         "workingCopyPolicy":"COMMITTED_BASE_ONLY",
         "configuredModel":h.model,
     });
@@ -455,6 +459,48 @@ fn preflight_response(h: &Host, project_id: &str, engine: &str) -> Result<Value,
     let mut out = base;
     out["optionsRevision"] = json!(rev);
     Ok(out)
+}
+
+fn git_head_revision(path: &str) -> Option<Value> {
+    if path.is_empty() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", path, "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then(|| json!(head))
+}
+
+fn git_has_uncommitted(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["-C", path, "status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Provision a task workspace with the registered project's committed
+/// baseline. `git clone` of a local path yields committed state only —
+/// uncommitted source changes are never copied (COMMITTED_BASE_ONLY).
+async fn provision_workspace(src: &str, ws: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(ws)?;
+    let status = tokio::process::Command::new("git")
+        .args(["clone", "--quiet", "--", src, "."])
+        .current_dir(ws)
+        .status()
+        .await?;
+    if !status.success() {
+        bail!("git clone exited {status}");
+    }
+    Ok(())
 }
 
 fn preflight(h: &Host, body: &Value) -> Result<Value, Response> {
@@ -633,16 +679,35 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
         Ok(d) => Arc::clone(d),
         Err(r) => return r,
     };
-    let final_task = match driver
-        .start_task(&task_id, &ws_path, instruction, key)
-        .await
-    {
+    let project_path = h
+        .project(project_id)
+        .ok()
+        .and_then(|p| p["path"].as_str().map(str::to_owned));
+    let launched = async {
+        match project_path.as_deref() {
+            Some(src) => provision_workspace(src, &ws_path)
+                .await
+                .map_err(|e| (e, "WORKSPACE_PROVISION_FAILED"))?,
+            None => {
+                return Err((
+                    anyhow::anyhow!("project path missing"),
+                    "WORKSPACE_PROVISION_FAILED",
+                ));
+            }
+        }
+        driver
+            .start_task(&task_id, &ws_path, instruction, key)
+            .await
+            .map_err(|e| (e, "NATIVE_START_FAILED"))
+    }
+    .await;
+    let final_task = match launched {
         Ok(()) => match store_of(h).and_then(|s| s.task(&task_id).map_err(|_| error("INTERNAL"))) {
             Ok(t) => t,
             Err(r) => return r,
         },
-        Err(e) => {
-            tracing::warn!(task_id, "task start failed: {e}");
+        Err((e, code)) => {
+            tracing::warn!(task_id, "task launch failed: {e}");
             let t = {
                 let mut s = match store_of(h) {
                     Ok(s) => s,
@@ -652,7 +717,7 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
                     .update(&task_id, |t| {
                         t["state"] = json!("FAILED");
                         t["quiescent"] = json!(true);
-                        t["reasonCode"] = json!("NATIVE_START_FAILED");
+                        t["reasonCode"] = json!(code);
                     })
                     .unwrap_or(task.clone());
                 let _ = s.event(&task_id, "task.failed", json!({"detail":format!("{e}")}));
@@ -660,7 +725,7 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
                     "create",
                     key,
                     "FAILED",
-                    &receipt_json(key, "FAILED", json!("native thread start failed")),
+                    &receipt_json(key, "FAILED", json!("native task launch failed")),
                 );
                 t
             };
