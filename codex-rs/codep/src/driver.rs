@@ -611,6 +611,68 @@ fn turn_item_tool_fields(item: &TurnItem) -> Option<serde_json::Value> {
     Some(v)
 }
 
+/// pi host `publicText` parity (AgentWorkersCode pi/src/host/store.ts):
+/// redact credential-shaped strings before a tool result becomes a public
+/// preview. ANSI control noise is stripped too — command output carries it
+/// and the renderer shows the preview verbatim in a <pre>.
+fn public_text(text: &str, limit: usize) -> String {
+    use std::sync::LazyLock;
+    static ANSI: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new("\u{1b}\\[[0-9;?]*[a-zA-Z]").unwrap());
+    static SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            "(?i)(bearer\\s+|(?:api[_-]?key|password|access[_-]?token)\\s*[:=]\\s*)[^\\s\"']+",
+        )
+        .unwrap()
+    });
+    static KEY: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new("sk-[A-Za-z0-9_-]{20,}").unwrap());
+    let s = ANSI.replace_all(text, "");
+    let s = SECRET.replace_all(&s, "$1[redacted]");
+    let s = KEY.replace_all(&s, "[redacted]");
+    s.chars().take(limit).collect()
+}
+
+/// worker-events/1 `result` on TOOL_END: pi emits a bounded publicText
+/// preview of the tool output; codep derives the same field from the
+/// completed item so the renderer's "查看结果" affordance works unchanged.
+fn tool_result_preview(item: &TurnItem) -> Option<String> {
+    use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+    use codex_protocol::items::*;
+    let raw = match item {
+        TurnItem::CommandExecution(i) => i.aggregated_output.clone(),
+        TurnItem::DynamicToolCall(i) => i.error.clone().or_else(|| {
+            i.content_items
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|c| match c {
+                            DynamicToolCallOutputContentItem::InputText { text } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|s| !s.is_empty())
+        }),
+        TurnItem::McpToolCall(i) => i
+            .error
+            .as_ref()
+            .map(|e| e.message.clone())
+            .or_else(|| {
+                i.result
+                    .as_ref()
+                    .and_then(|r| serde_json::to_string(&r.content).ok())
+                    .filter(|s| s != "[]")
+            }),
+        _ => None,
+    };
+    raw.map(|s| public_text(&s, 4096)).filter(|s| !s.is_empty())
+}
+
 async fn project(
     d: &Arc<Driver>,
     task: &str,
@@ -787,6 +849,9 @@ async fn project(
             if let Some(fields) = turn_item_tool_fields(&e.item) {
                 let mut payload = fields;
                 payload["nativeTurnId"] = json!(e.turn_id);
+                if let Some(result) = tool_result_preview(&e.item) {
+                    payload["result"] = json!(result);
+                }
                 let s = d.store.lock().map_err(|_| anyhow::anyhow!("STORE_POISONED"))?;
                 s.event(task, "TOOL_END", payload)?;
             }
