@@ -318,7 +318,7 @@ pub async fn dispatch(State(h): State<Arc<Host>>, req: Request) -> Response {
         ("GET", ["local", "v1", "tasks"]) => list_tasks(&h, get("limit")),
         ("GET", ["local", "v1", "task-requests", key]) => create_receipt(&h, key),
         ("GET", ["local", "v1", "tasks", id]) => match h.task(id) {
-            Ok(t) => reply(200, public_task(&t)),
+            Ok(t) => reply(200, project_task(&h, &t)),
             Err(r) => r,
         },
         ("POST", ["local", "v1", "tasks", id, "commands"]) => command(&h, id, &body).await,
@@ -564,6 +564,37 @@ fn public_task(t: &Value) -> Value {
         "pause": false,
         "resume": false,
     });
+    // The detail contract wants numeric input/output/cacheRead; the store
+    // records the engine's string token counters.
+    if let Some(u) = t["usage"].as_object() {
+        let num = |k: &str| {
+            u.get(k)
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
+                })
+                .unwrap_or(0)
+        };
+        v["usage"] = json!({
+            "input": num("inputTokens"),
+            "output": num("outputTokens"),
+            "cacheRead": num("cachedInputTokens"),
+        });
+    }
+    v
+}
+
+/// Task detail projection: public task plus the durable-event spine's
+/// high-water facts the renderer uses for stall detection.
+fn project_task(h: &Host, t: &Value) -> Value {
+    let mut v = public_task(t);
+    if let Ok(s) = h.store.lock() {
+        if let Some(ev) = s.last_event(t["taskId"].as_str().unwrap_or_default()) {
+            v["lastEventAt"] = ev["occurredAt"].clone();
+            v["lastEventKind"] = ev["kind"].clone();
+        }
+    }
     v
 }
 
@@ -584,6 +615,8 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
             "hooks",
             "policyPresetId",
             "materials",
+            "executionOptions",
+            "deadlineMs",
         ],
     ) {
         Ok(o) => o,
@@ -604,6 +637,27 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
     if instruction.len() > 16384 {
         return error("INVALID_ARGUMENT");
     }
+    // Optional execution window: 60s–24h per the launcher contract; absent
+    // means the host default applies.
+    const DEFAULT_DEADLINE_MS: u64 = 7_200_000;
+    let deadline_ms = match o.get("deadlineMs") {
+        None => DEFAULT_DEADLINE_MS,
+        Some(v) => match v.as_u64() {
+            Some(ms) if (60_000..=86_400_000).contains(&ms) => ms,
+            _ => return error("INVALID_ARGUMENT"),
+        },
+    };
+    let deadline_epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+        + u128::from(deadline_ms);
+    let execution_options = match o.get("executionOptions") {
+        None => Value::Null,
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => return error("INVALID_ARGUMENT"),
+    };
+    let mut replay_task = None;
     {
         let s = match store_of(h) {
             Ok(s) => s,
@@ -618,14 +672,17 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
                     .unwrap_or_default()
                     .into_iter()
                     .find(|t| t["requestKey"].as_str() == Some(key));
-                return match t {
-                    Some(t) => reply(202, public_task(&t)),
-                    None => reply(202, s.lookup("create", key).unwrap_or(json!({}))),
-                };
+                match t {
+                    Some(t) => replay_task = Some(t),
+                    None => return reply(202, s.lookup("create", key).unwrap_or(json!({}))),
+                }
             }
             Ok(None) => {}
             Err(_) => return error("IDEMPOTENCY_CONFLICT"),
         }
+    }
+    if let Some(t) = replay_task {
+        return reply(202, project_task(h, &t));
     }
     let preflight = match preflight_response(h, project_id, engine) {
         Ok(p) => p,
@@ -655,6 +712,9 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
         "currentCommandId":key,
         "quiescent":false,
         "configuredModel":h.model,
+        "executionOptions":execution_options,
+        "deadlineMs":deadline_ms,
+        "deadlineEpochMillis":deadline_epoch_ms.to_string(),
         "workspace":workspace,
         "segmentId":format!("seg-{}",canon::new_id()),
         "ownerEpoch":h.boot_id,
@@ -702,10 +762,13 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
     }
     .await;
     let final_task = match launched {
-        Ok(()) => match store_of(h).and_then(|s| s.task(&task_id).map_err(|_| error("INTERNAL"))) {
-            Ok(t) => t,
-            Err(r) => return r,
-        },
+        Ok(()) => {
+            driver.watch_deadline(&task_id, Duration::from_millis(deadline_ms));
+            match store_of(h).and_then(|s| s.task(&task_id).map_err(|_| error("INTERNAL"))) {
+                Ok(t) => t,
+                Err(r) => return r,
+            }
+        }
         Err((e, code)) => {
             tracing::warn!(task_id, "task launch failed: {e}");
             let t = {
@@ -715,9 +778,12 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
                 };
                 let t = s
                     .update(&task_id, |t| {
+                        let now = canon::now();
                         t["state"] = json!("FAILED");
                         t["quiescent"] = json!(true);
                         t["reasonCode"] = json!(code);
+                        t["endedAt"] = json!(now.clone());
+                        t["completedAt"] = json!(now);
                     })
                     .unwrap_or(task.clone());
                 let _ = s.event(&task_id, "task.failed", json!({"detail":format!("{e}")}));
@@ -734,7 +800,7 @@ async fn create_task(h: &Arc<Host>, body: &Value) -> Response {
         }
     };
     // Refresh the idempotent-replay result so it carries nativeSessionId.
-    let projected = public_task(&final_task);
+    let projected = project_task(h, &final_task);
     {
         let mut s = match store_of(h) {
             Ok(s) => s,
@@ -758,7 +824,10 @@ fn create_receipt(h: &Host, key: &str) -> Response {
         .into_iter()
         .find(|t| t["requestKey"].as_str() == Some(key));
     match found {
-        Some(t) => reply(200, public_task(&t)),
+        Some(t) => {
+            drop(s);
+            reply(200, project_task(h, &t))
+        }
         None => match s.lookup("create", key) {
             Ok(v) => reply(200, v),
             Err(_) => error("REQUEST_NOT_FOUND"),
@@ -812,6 +881,15 @@ fn op_receipt(h: &Host, task: &str, key: &str) -> Response {
 
 // ---------- commands (STOP / PAUSE / RESUME) ----------
 
+/// Settled task states: a late event or a pending STOP must not overwrite
+/// them (matches driver's `terminal`).
+fn terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        "FAILED" | "CANCELLED" | "UNKNOWN" | "TIMED_OUT" | "INTERRUPTED" | "STOPPED"
+    )
+}
+
 fn guard_fields(t: &Value, o: &Map<String, Value>) -> Result<(), Response> {
     for (field, current) in [
         ("generation", &t["generation"]),
@@ -820,6 +898,11 @@ fn guard_fields(t: &Value, o: &Map<String, Value>) -> Result<(), Response> {
         ("targetCommandId", &t["currentCommandId"]),
     ] {
         let sent = o.get(field).cloned().unwrap_or(Value::Null);
+        // The stop guard legitimately carries null session/turn ids when the
+        // caller has not observed them yet — null means "not asserted".
+        if sent.is_null() && matches!(field, "nativeSessionId" | "nativeTurnId") {
+            continue;
+        }
         if sent != *current {
             return Err(error("NATIVE_TARGET_CHANGED"));
         }
@@ -922,8 +1005,8 @@ async fn command(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                         .ok()
                         .and_then(|s| s.task(&task).ok())
                         .map(|t| {
-                            t["state"].as_str() == Some("CANCELLED")
-                                && t["quiescent"].as_bool() == Some(true)
+                            t["quiescent"].as_bool() == Some(true)
+                                && t["state"].as_str().map(terminal_state).unwrap_or(false)
                         })
                         .unwrap_or(true);
                     if done {
@@ -937,10 +1020,13 @@ async fn command(h: &Arc<Host>, id: &str, body: &Value) -> Response {
                         .and_then(|t| t["currentCommandId"].as_str().map(str::to_owned))
                         .unwrap_or_default();
                     let _ = s.update(&task, |t| {
-                        if t["state"].as_str() != Some("CANCELLED") {
+                        if !t["state"].as_str().map(terminal_state).unwrap_or(false) {
+                            let now = canon::now();
                             t["state"] = json!("CANCELLED");
                             t["quiescent"] = json!(true);
                             t["reasonCode"] = json!("TASK_STOPPED");
+                            t["endedAt"] = json!(now.clone());
+                            t["completedAt"] = json!(now);
                         }
                         t.as_object_mut().map(|m| m.remove("pendingStopKey"));
                     });
