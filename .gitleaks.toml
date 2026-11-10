@@ -1,0 +1,25 @@
+title = "agent public repos gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and vendored upstream test data"
+paths = [
+  '''.*(test|tests|Test|Tests|it|IT|fixture|Fixture|golden|vector|e2e|spec)[/\\._-].*''',
+  '''.*Cargo\.lock''',
+  '''.*service-dependency\.lock\.json''',
+]
+regexTarget = "secret"
+regexes = [
+  '''0123456789abcdef''',
+  '''AKIAABCDEFGHIJKLMNOP''',
+  '''ASIAABCDEFGHIJKLMNOP''',
+  '''sk-proj-12345[0-9A-E]*''',
+  '''eyJhbGciOiJub25lIn0\..*''',
+  '''f19-bad-preset''',
+  '''ma00-it-[0-9a-f]+''',
+  '''tok-SECRET-[a-z0-9]+''',
+  '''curve25519-dalek''',
+  '''0xcbf29ce484222325_u64''',
+]
