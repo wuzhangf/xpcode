@@ -150,7 +150,7 @@ fn init(state: &Path, project: Option<&Path>) -> Result<()> {
         }));
         Ok(())
     };
-    let e2e = Path::new(r"D:\project\worker-state\e2e-project");
+    let e2e = Path::new(&std::env::var("CODEP_E2E_WORKDIR").unwrap_or_else(|_| "./codep-e2e-workdir".to_string()));
     if e2e.is_dir() {
         register("e2e-scratch", e2e)?;
     }

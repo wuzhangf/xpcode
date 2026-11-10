@@ -93,7 +93,7 @@ wire_api = "responses"                 # only valid value
 env_http_headers = { "<header-name>" = "ENV_VAR_NAME" }   # e.g. x-opencode-session
 requires_openai_auth = false
 ```
-Values come from process env (`D:\project\env` loads MODEL_API_KEY/MODEL_BASE_URL/MODEL_NAME/LLM_HEADER_x_opencode_session). Never write the key into config.toml — env_key is a variable NAME, resolved at call time.
+Values come from process env (`<env-dir>` loads MODEL_API_KEY/MODEL_BASE_URL/MODEL_NAME/LLM_HEADER_x_opencode_session). Never write the key into config.toml — env_key is a variable NAME, resolved at call time.
 
 ## Build environment (this machine)
 
