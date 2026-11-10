@@ -6,7 +6,7 @@ Spec extracted from `EnterpriseDockerCode/workers/codex/src/host.rs` (HTTP surfa
 `packages/personal-gateway-core/src/upstream.ts` + Electron renderer contract
 `apps/codeagent-desktop/packages/protocol/src/native-task.ts`.
 
-Reference impl line numbers: `D:\project\workspace\EnterpriseDockerCode\workers\codex\src\host.rs`.
+Reference impl line numbers: `<upstream-workspace>/workers/codex/src/host.rs`.
 
 ## 0. Identity
 
