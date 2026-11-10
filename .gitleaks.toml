@@ -3,12 +3,29 @@ title = "agent public repos gitleaks config"
 [extend]
 useDefault = true
 
+# Internal-trace rules: private-machine paths and private repo names
+# must never land in public repos.
+[[rules]]
+id = "internal-paths"
+description = "Internal machine paths (D:\\project, /Volumes/Data) must not be committed"
+regex = '''D:[\\/]project[\\/]|/Volumes/Data/'''
+[[rules]]
+id = "private-repo-names"
+description = "Private repository and internal workspace names"
+regex = '''EnterpriseDockerCode|BusinessAgentCode|codex-workspace'''
+[[rules]]
+id = "local-usernames"
+description = "Local machine usernames embedded in paths"
+regex = '''/Users/wuzf|C:\\\\Users\\\\wuzhangf|wuzf/'''
+
 [allowlist]
-description = "Test fixtures and vendored upstream test data"
+description = "Test fixtures, vendored upstream data and platform system paths"
 paths = [
   '''.*(test|tests|Test|Tests|it|IT|fixture|Fixture|golden|vector|e2e|spec)[/\\._-].*''',
   '''.*Cargo\.lock''',
   '''.*service-dependency\.lock\.json''',
+  '''.*\.gitleaks-baseline\.json''',
+  '''.*seatbelt.*\.sbpl''',
 ]
 regexTarget = "secret"
 regexes = [
