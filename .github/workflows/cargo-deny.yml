@@ -21,7 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
 
       - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+        uses: EmbarkStudios/cargo-deny-action@9c67a826e39827395bfa619cd85cb2aaeb43cfaa # v2
         with:
           rust-version: 1.99.1
           manifest-path: ./codex-rs/Cargo.toml
